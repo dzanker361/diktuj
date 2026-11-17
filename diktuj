@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""diktuj - jednoduché české diktování pro Linux.
+
+Použití:
+  diktuj            přepínač: spustí nahrávání, nebo ho zastaví a přepíše
+  diktuj start      spustí nahrávání
+  diktuj stop       zastaví nahrávání a na pozadí spustí přepis
+  diktuj status     ukáže, jestli se nahrává
+  diktuj retry      dopřepíše všechny nahrávky, které ještě nemají text
+  diktuj receive    přijímá nahrávky z telefonu (běží jako služba, viz diktuj-receiver.service)
+  diktuj token      vytvoří/ukáže token a adresu pro nastavení telefonu
+  diktuj inbox      projde nepřepsané nahrávky a u každé se zeptá, jestli ji přepsat
+
+Nahrávky se ukládají po 10minutových segmentech (OGG/Opus) a zůstávají na disku,
+takže se při výpadku sítě nebo limitu API nic neztratí.
+Přepis: lokálně přes whisper-ctranslate2 (výchozí), nebo přes Groq API, nebo obojí (backend = auto).
+Jen standardní knihovna Pythonu + ffmpeg.
+"""
+import configparser
+import datetime as dt
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "diktuj" / "config.ini"
+STATE_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share")) / "diktuj"
+SESSIONS_DIR = STATE_DIR / "sessions"
+CURRENT = STATE_DIR / "current.json"
+
+DEFAULTS = {
+    "api_key": "",
+    "api_url": "https://api.groq.com/openai/v1/audio/transcriptions",
+    "model": "whisper-large-v3",
+    "language": "cs",
+    "output_dir": str(HOME / "Diktovani"),
+    "segment_seconds": "600",
+    "audio_source": "default",
+    "max_retries": "6",
+    "context_chars": "220",
+    "notify": "yes",
+    # backend: local = whisper-ctranslate2 na tomto počítači (zdarma, offline)
+    #          groq  = cloud API (rychlé, vyžaduje api_key)
+    #          auto  = zkusí Groq a při chybě/limitu dokončí lokálně
+    "backend": "local",
+    "whisper_cmd": "whisper-ctranslate2",
+    "whisper_model": "small",
+    "whisper_threads": "4",
+    # příjem nahrávek z telefonu
+    "token": "",
+    "listen_port": "8765",
+    # confirm: dialog = zeptá se okénkem, auto = přepíše hned, notify = jen upozorní
+    "confirm": "dialog",
+}
+
+SESSION_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+SEG_RE = re.compile(r"^seg_\d{3}\.(ogg|m4a)$")
+MAX_SEG_BYTES = 200 * 1024 * 1024
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#",), strict=False)
+    if CONFIG_PATH.exists():
+        parser.read(CONFIG_PATH, encoding="utf-8")
+        if parser.has_section("diktuj"):
+            cfg.update({k: v for k, v in parser.items("diktuj")})
+    if os.environ.get("GROQ_API_KEY"):
+        cfg["api_key"] = os.environ["GROQ_API_KEY"]
+    return cfg
+
+
+def notify(cfg, title, body=""):
+    print(f"[diktuj] {title} {body}".strip(), file=sys.stderr)
+    if cfg.get("notify", "yes").lower() in ("yes", "true", "1") and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "diktuj", "-t", "4000", title, body],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- nahrávání
+
+def read_current():
+    try:
+        data = json.loads(CURRENT.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+    pid = data.get("pid")
+    try:
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"ffmpeg" not in f.read():
+                raise ProcessLookupError
+    except (ProcessLookupError, FileNotFoundError, PermissionError, TypeError):
+        CURRENT.unlink(missing_ok=True)
+        return None
+    return data
+
+
+def cmd_start(cfg):
+    if read_current():
+        print("Už se nahrává.", file=sys.stderr)
+        return 1
+    if not shutil.which("ffmpeg"):
+        notify(cfg, "diktuj: chybí ffmpeg", "sudo pacman -S ffmpeg")
+        return 1
+    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    sess = SESSIONS_DIR / stamp
+    sess.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-f", "pulse", "-i", cfg["audio_source"],
+        "-ac", "1", "-ar", "16000",
+        "-c:a", "libopus", "-b:a", "24k", "-application", "voip",
+        "-f", "segment", "-segment_format", "ogg",
+        "-segment_time", cfg["segment_seconds"], "-reset_timestamps", "1",
+        str(sess / "seg_%03d.ogg"),
+    ]
+    log = open(sess / "ffmpeg.log", "ab")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                            start_new_session=True)
+    time.sleep(0.6)
+    if proc.poll() is not None:
+        notify(cfg, "diktuj: nahrávání se nespustilo", f"viz {sess/'ffmpeg.log'}")
+        return 1
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CURRENT.write_text(json.dumps({"pid": proc.pid, "session": str(sess)}))
+    notify(cfg, "● Nahrávám")
+    return 0
+
+
+def cmd_stop(cfg):
+    cur = read_current()
+    if not cur:
+        print("Nenahrává se.", file=sys.stderr)
+        return 1
+    pid = cur["pid"]
+    os.kill(pid, signal.SIGINT)  # ffmpeg korektně dokončí poslední segment
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGTERM)
+    CURRENT.unlink(missing_ok=True)
+    notify(cfg, "■ Zastaveno, přepisuji…")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_transcribe", cur["session"]],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return 0
+
+
+def cmd_status(cfg):
+    cur = read_current()
+    print("nahrává se: " + cur["session"] if cur else "nenahrává se")
+    pending = pending_sessions()
+    if pending:
+        print(f"nepřepsáno: {len(pending)} (spusť: diktuj retry)")
+    return 0
+
+
+# ------------------------------------------------------------------ přepis
+
+class TranscribeError(Exception):
+    pass
+
+
+def multipart(fields, file_field, file_path):
+    boundary = "----diktuj" + uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    head = (f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+            f'filename="{file_path.name}"\r\nContent-Type: {ctype}\r\n\r\n').encode()
+    parts.append(head + file_path.read_bytes() + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def transcribe_file(cfg, path, prev_text):
+    """Pošle jeden segment na API. Opakuje při 429 a síťových chybách."""
+    fields = {
+        "model": cfg["model"],
+        "language": cfg["language"],
+        "response_format": "json",
+        "temperature": "0",
+    }
+    ctx = prev_text[-int(cfg["context_chars"]):].strip()
+    if ctx:
+        fields["prompt"] = ctx  # kontext z konce předchozího segmentu
+    body, ctype = multipart(fields, "file", path)
+    max_retries = int(cfg["max_retries"])
+    delay = 5
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(cfg["api_url"], data=body, method="POST", headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": ctype,
+            "User-Agent": "diktuj/1.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("text", "").strip()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise TranscribeError(f"API odmítlo klíč (HTTP {e.code}). Zkontroluj api_key v {CONFIG_PATH}")
+            if e.code == 429 or e.code >= 500:
+                wait = delay
+                try:
+                    wait = max(wait, float(e.headers.get("retry-after", 0)) + 1)
+                except (TypeError, ValueError):
+                    pass
+                if attempt == max_retries:
+                    raise TranscribeError(f"HTTP {e.code} i po {max_retries} pokusech")
+                print(f"[diktuj] HTTP {e.code}, čekám {wait:.0f} s", file=sys.stderr)
+                time.sleep(wait)
+                delay = min(delay * 2, 120)
+                continue
+            raise TranscribeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            if attempt == max_retries:
+                raise TranscribeError(f"síť: {e}")
+            print(f"[diktuj] síť: {e}, čekám {delay} s", file=sys.stderr)
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+    raise TranscribeError("neznámá chyba")
+
+
+def seg_files(sess):
+    return sorted(list(Path(sess).glob("seg_*.ogg")) + list(Path(sess).glob("seg_*.m4a")),
+                  key=lambda p: p.name)
+
+
+def is_done(sess):
+    return (sess / "done").exists()
+
+
+def pending_sessions():
+    if not SESSIONS_DIR.exists():
+        return []
+    cur = read_current()
+    active = Path(cur["session"]) if cur else None
+    return [s for s in sorted(SESSIONS_DIR.iterdir())
+            if s.is_dir() and s != active and not is_done(s) and not (s / "incoming").exists()
+            and seg_files(s)]
+
+
+def transcribe_groq(cfg, todo):
+    """Přepíše segmenty přes Groq. Vyhodí TranscribeError, kdyby to nešlo."""
+    prev = ""
+    for seg in todo:
+        text = transcribe_file(cfg, seg, prev)
+        seg.with_suffix(".txt").write_text(text, encoding="utf-8")
+        prev = text or prev
+
+
+def transcribe_local(cfg, todo, sess):
+    """Přepíše segmenty lokálně přes whisper-ctranslate2 (jedno načtení modelu pro všechny segmenty)."""
+    cmd_name = cfg["whisper_cmd"]
+    if not shutil.which(cmd_name):
+        raise TranscribeError(f"chybí {cmd_name} (pip/pipx install whisper-ctranslate2)")
+    cmd = []
+    if shutil.which("nice"):
+        cmd += ["nice", "-n", "19"]  # ať se u toho dá pracovat
+    if shutil.which("ionice"):
+        cmd += ["ionice", "-c3"]
+    cmd += [cmd_name, *[str(s) for s in todo],
+            "--device", "cpu", "--model", cfg["whisper_model"],
+            "--language", cfg["language"], "--output_format", "txt",
+            "--threads", cfg["whisper_threads"], "--output_dir", str(sess)]
+    with open(sess / "whisper.log", "ab") as log:
+        rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log).returncode
+    for seg in todo:
+        txt = seg.with_suffix(".txt")
+        if txt.exists():  # whisper dělí na řádky, pro diktát chceme souvislý text
+            txt.write_text(" ".join(txt.read_text(encoding="utf-8").split()), encoding="utf-8")
+    missing = [s.name for s in todo if not s.with_suffix(".txt").exists()]
+    if rc != 0 or missing:
+        raise TranscribeError(f"lokální přepis selhal (viz {sess / 'whisper.log'})")
+
+
+def transcribe_session(cfg, sess):
+    sess = Path(sess)
+    backend = cfg["backend"].lower()
+    segs = seg_files(sess)
+    todo = [s for s in segs if s.stat().st_size >= 600 and not s.with_suffix(".txt").exists()]
+    try:
+        if todo and backend in ("groq", "auto"):
+            if not cfg["api_key"]:
+                if backend == "groq":
+                    notify(cfg, "diktuj: chybí api_key", f"doplň do {CONFIG_PATH}")
+                    return 1
+            else:
+                try:
+                    transcribe_groq(cfg, todo)
+                except TranscribeError as e:
+                    if backend == "groq":
+                        raise
+                    notify(cfg, "diktuj: Groq nejde, dokončuji lokálně", str(e))
+        todo = [s for s in todo if not s.with_suffix(".txt").exists()]
+        if todo:
+            if backend == "groq":
+                raise TranscribeError("nepřepsáno")
+            transcribe_local(cfg, todo, sess)
+    except TranscribeError as e:
+        notify(cfg, "diktuj: přepis selhal", f"{e} — audio zůstává, zkus 'diktuj retry'")
+        return 1
+    texts = []
+    for seg in segs:
+        txt = seg.with_suffix(".txt")
+        texts.append(txt.read_text(encoding="utf-8") if txt.exists() else "")
+    out_dir = Path(cfg["output_dir"]).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{sess.name}.txt"
+    out.write_text(" ".join(t for t in texts if t).strip() + "\n", encoding="utf-8")
+    (sess / "done").write_text(str(out))
+    notify(cfg, "✓ Hotovo", str(out))
+    return 0
+
+
+def cmd_retry(cfg):
+    rc = 0
+    for s in pending_sessions():
+        rc |= transcribe_session(cfg, s)
+    return rc
+
+
+# ------------------------------------------------- příjem nahrávek z telefonu
+
+class Receiver(BaseHTTPRequestHandler):
+    cfg = {}
+    server_version = "diktuj"
+
+    def log_message(self, fmt, *args):
+        print("[diktuj-receiver] " + (fmt % args), file=sys.stderr, flush=True)
+
+    def _reply(self, code, body=b"ok", ctype="text/plain; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        token = self.cfg.get("token", "")
+        given = self.headers.get("X-Token", "")
+        if token and hmac.compare_digest(given.encode(), token.encode()):
+            return True
+        self._reply(401, "špatný token")
+        return False
+
+    def do_GET(self):
+        if self.path == "/ping" and self._auth():
+            self._reply(200, "diktuj")
+        elif self.path != "/ping":
+            self._reply(404, "nenalezeno")
+
+    def do_PUT(self):
+        if not self._auth():
+            return
+        m = re.fullmatch(r"/upload/([^/]+)/([^/]+)", self.path)
+        if not m or not SESSION_RE.match(m.group(1)) or not SEG_RE.match(m.group(2)):
+            return self._reply(400, "neplatná cesta")
+        session, name = m.groups()
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            length = -1
+        if length <= 0 or length > MAX_SEG_BYTES:
+            return self._reply(400 if length <= 0 else 413, "neplatná velikost")
+        sess = SESSIONS_DIR / session
+        if (sess / "received").exists():  # už přijato dříve, jen odpovíme
+            self.rfile.read(length)
+            return self._reply(200)
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / "incoming").touch()
+        part = sess / (name + ".part")
+        remaining = length
+        with open(part, "wb") as f:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        if remaining:
+            part.unlink(missing_ok=True)
+            return self._reply(400, "neúplný přenos")
+        os.replace(part, sess / name)
+        self._reply(200)
+
+    def do_POST(self):
+        if not self._auth():
+            return
+        if self.path != "/done":
+            return self._reply(404, "nenalezeno")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(min(length, 1 << 20)).decode("utf-8"))
+            session = data["session"]
+            expected = {seg["name"]: int(seg["size"]) for seg in data["segments"]}
+        except (ValueError, KeyError, TypeError):
+            return self._reply(400, "neplatná data")
+        if not SESSION_RE.match(session) or not expected or not all(SEG_RE.match(n) for n in expected):
+            return self._reply(400, "neplatná data")
+        sess = SESSIONS_DIR / session
+        if (sess / "received").exists():
+            return self._reply(200)
+        missing = [n for n, size in expected.items()
+                   if not (sess / n).exists() or (sess / n).stat().st_size != size]
+        if missing:
+            return self._reply(409, json.dumps({"missing": missing}), "application/json")
+        (sess / "received").touch()
+        (sess / "incoming").unlink(missing_ok=True)
+        self._reply(200)
+        print(f"[diktuj-receiver] přijata nahrávka {session}", file=sys.stderr, flush=True)
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_ask", str(sess)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_receive(cfg):
+    if not cfg["token"]:
+        print("Chybí token. Spusť 'diktuj token' a pak to zkus znovu.", file=sys.stderr)
+        return 1
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    Receiver.cfg = cfg
+    server = ThreadingHTTPServer(("0.0.0.0", int(cfg["listen_port"])), Receiver)
+    server.daemon_threads = True
+    print(f"[diktuj-receiver] poslouchám na portu {cfg['listen_port']}", file=sys.stderr, flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def local_ips():
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True).stdout
+        return [m.group(1) for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)", out)]
+    except OSError:
+        return []
+
+
+def cmd_token(cfg):
+    token = cfg["token"]
+    if not token:
+        token = secrets.token_urlsafe(12)
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        text = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else "[diktuj]\n"
+        if "[diktuj]" not in text:
+            text = "[diktuj]\n" + text
+        CONFIG_PATH.write_text(text.rstrip("\n") + f"\ntoken = {token}\n", encoding="utf-8")
+        os.chmod(CONFIG_PATH, 0o600)
+        print("Token vytvořen a uložen do", CONFIG_PATH)
+    print("Token:  ", token)
+    ips = local_ips()
+    for ip in ips:
+        print(f"Adresa: {ip}:{cfg['listen_port']}")
+    if not ips:
+        print(f"Adresa: <IP tohoto počítače>:{cfg['listen_port']}")
+    print("Obojí zadej v aplikaci Diktuj v telefonu (token jde zkopírovat přes schránku KDE Connect).")
+    return 0
+
+
+def session_summary(sess):
+    segs = seg_files(sess)
+    total = 0.0
+    if shutil.which("ffprobe"):
+        for seg in segs:
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "default=noprint_wrappers=1:nokey=1", str(seg)],
+                               capture_output=True, text=True)
+            try:
+                total += float(r.stdout.strip())
+            except ValueError:
+                pass
+    length = f"{total / 60:.0f} min" if total else f"{sum(s.stat().st_size for s in segs) / 1e6:.1f} MB"
+    return f"{length}, {len(segs)} segment(ů)"
+
+
+def ask_dialog(text):
+    import tkinter as tk
+    result = {"ok": False}
+    root = tk.Tk()
+    root.title("diktuj")
+    root.attributes("-topmost", True)
+    tk.Label(root, text=text, justify="left", padx=22, pady=16, font=("sans", 11)).pack()
+    frame = tk.Frame(root)
+    frame.pack(pady=(0, 16))
+
+    def yes():
+        result["ok"] = True
+        root.destroy()
+
+    tk.Button(frame, text="Přepsat teď", width=14, command=yes).pack(side="left", padx=6)
+    tk.Button(frame, text="Později", width=14, command=root.destroy).pack(side="left", padx=6)
+    root.bind("<Return>", lambda e: yes())
+    root.bind("<Escape>", lambda e: root.destroy())
+    root.focus_force()
+    root.mainloop()
+    return result["ok"]
+
+
+def cmd_ask(cfg, sess):
+    """Zeptá se, jestli nahrávku přepsat (jedno kliknutí), a případně přepis spustí."""
+    sess = Path(sess)
+    if is_done(sess):
+        return 0
+    os.environ.setdefault("DISPLAY", ":0")
+    mode = cfg["confirm"].lower()
+    text = f"Nová nahrávka z telefonu\n{sess.name}\n{session_summary(sess)}\n\nPřepsat teď?"
+    if mode == "auto":
+        go = True
+    elif mode == "notify":
+        notify(cfg, "Nová nahrávka z telefonu", f"{session_summary(sess)} — spusť: diktuj inbox")
+        return 0
+    else:
+        try:
+            go = ask_dialog(text)
+        except Exception as e:  # bez grafiky nebo bez tkinter
+            notify(cfg, "Nová nahrávka z telefonu", f"okno nejde zobrazit ({e}); spusť: diktuj inbox")
+            return 0
+    if not go:
+        notify(cfg, "Přepis odložen", "spustíš ho příkazem: diktuj inbox")
+        return 0
+    notify(cfg, "Přepisuji…", sess.name)
+    return transcribe_session(cfg, sess)
+
+
+def cmd_inbox(cfg):
+    pend = pending_sessions()
+    if not pend:
+        print("Nic k přepsání.")
+        return 0
+    rc = 0
+    for s in pend:
+        rc |= cmd_ask(cfg, s)
+    return rc
+
+
+def main(argv):
+    cfg = load_config()
+    cmd = argv[1] if len(argv) > 1 else "toggle"
+    if cmd == "toggle":
+        return cmd_stop(cfg) if read_current() else cmd_start(cfg)
+    if cmd == "start":
+        return cmd_start(cfg)
+    if cmd == "stop":
+        return cmd_stop(cfg)
+    if cmd == "status":
+        return cmd_status(cfg)
+    if cmd == "retry":
+        return cmd_retry(cfg)
+    if cmd == "receive":
+        return cmd_receive(cfg)
+    if cmd == "token":
+        return cmd_token(cfg)
+    if cmd == "inbox":
+        return cmd_inbox(cfg)
+    if cmd == "_ask" and len(argv) > 2:
+        return cmd_ask(cfg, argv[2])
+    if cmd == "_transcribe" and len(argv) > 2:
+        return transcribe_session(cfg, argv[2])
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

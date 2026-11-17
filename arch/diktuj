@@ -73,7 +73,7 @@ MAX_SEG_BYTES = 200 * 1024 * 1024
 
 def load_config():
     cfg = dict(DEFAULTS)
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#",), strict=False)
     if CONFIG_PATH.exists():
         parser.read(CONFIG_PATH, encoding="utf-8")
         if parser.has_section("diktuj"):
