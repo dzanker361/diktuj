@@ -1,0 +1,14 @@
+[Unit]
+Description=diktuj: příjem nahrávek z telefonu
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/diktuj receive
+Restart=on-failure
+RestartSec=5
+# pro okno "Přepsat teď?"; uprav, pokud nepoužíváš displej :0
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+
+[Install]
+WantedBy=default.target
